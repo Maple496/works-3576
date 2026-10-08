@@ -1,165 +1,181 @@
-// src/main.js —— 入口：创建画布、装配模块、Work.register 容器合同
-// 职责：唯一在此注册容器；mount 建 canvas 并挂入 ctx.stage；destroy 停 RAF、解绑监听、清 DOM。
-
-// 修复 load 错误（Work.register is not a function）：
-// 不再用 `var Work = Work || {}` 自建空对象覆盖平台注入的全局 Work，
-// 而是显式取全局（window/globalThis）上的 Work；若平台以其他形式提供注册函数，
-// 也做兼容桥接，保证 mount/destroy 合同一定注册成功。
+// src/main.js —— 入口：创建画布、装配 Engine/Rules/UI，Work.register 容器合同
+// 职责：唯一在此注册容器；mount 建 canvas 挂入 ctx.stage；destroy 停 RAF、解绑监听、清 DOM。
+// 纪律：RAF/监听句柄保存在 Work.register 闭包可见变量上，destroy 逐一取消，保证零残留。
 (function () {
-  var g = typeof globalThis !== 'undefined' ? globalThis : window;
+  var gt = typeof globalThis !== 'undefined' ? globalThis : window;
 
+  // 显式取全局 Work，兼容桥接 register，避免 load 阶段抛错
   var host;
   if (typeof Work === 'object' && Work !== null && typeof Work.register === 'function') {
-    host = Work; // 平台已注入 Work.register
+    host = Work;
   } else {
-    host = g.Work = (typeof g.Work === 'object' && g.Work !== null) ? g.Work : {};
+    host = gt.Work = (typeof gt.Work === 'object' && gt.Work !== null) ? gt.Work : {};
     if (typeof host.register !== 'function') {
-      if (typeof g.register === 'function') {
-        // 平台提供顶层 register 时桥接
-        host.register = function (def) { g.register(def); };
+      if (typeof gt.register === 'function') {
+        host.register = function (def) { gt.register(def); };
       } else {
-        // 兜底：记录定义，避免 load 阶段抛错
         host.register = function (def) { host.__definition = def; };
       }
     }
   }
 
+  // —— Work.register 闭包级句柄（destroy 可见可清）——
+  var raf = 0;
+  var canvas = null;
+  var ctx2d = null; // 画布 2D 上下文
+  var onResize = null;
+  var boundPointerDown = null;
+  var boundPointerMove = null;
+  var boundKeyDown = null;
+  var boundOnBounds = null;
+  var started = false;
+
+  var cursor = { col: 7, row: 7 };
+
+  var KEYMAP = {
+    ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+    ArrowUp: [0, -1], ArrowDown: [0, 1],
+    KeyA: [-1, 0], KeyD: [1, 0],
+    KeyW: [0, -1], KeyS: [0, 1]
+  };
+
+  function clampCursor() {
+    var n = Engine.getSize();
+    if (n <= 0) { n = 15; }
+    if (cursor.col < 0) cursor.col = 0;
+    if (cursor.row < 0) cursor.row = 0;
+    if (cursor.col > n - 1) cursor.col = n - 1;
+    if (cursor.row > n - 1) cursor.row = n - 1;
+  }
+
+  function markStarted() {
+    if (started) return;
+    started = true;
+    if (typeof UI.markStarted === 'function') UI.markStarted();
+  }
+
+  function applySize(w, h) {
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.position = 'absolute';
+    canvas.style.left = '0';
+    canvas.style.top = '0';
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    Engine.layout(w, h);
+  }
+
+  function cellFromEvent(e) {
+    var rect = canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var y = e.clientY - rect.top;
+    return UI.pickCell(x, y); // {x, y} 格子坐标或 null
+  }
+
+  function onPointerDown(e) {
+    e.preventDefault();
+    markStarted();
+    var cell = cellFromEvent(e);
+    if (cell) {
+      cursor.col = cell.x;
+      cursor.row = cell.y;
+      Engine.place(cell.x, cell.y);
+    }
+  }
+
+  function onPointerMove(e) {
+    // 悬停高亮为可选增强；触屏以 pointerdown 为准
+    if (!e || e.pointerType === 'touch') return;
+    var cell = cellFromEvent(e);
+    if (cell) {
+      cursor.col = cell.x;
+      cursor.row = cell.y;
+    }
+  }
+
+  function onKeyDown(e) {
+    var d = KEYMAP[e.code];
+    if (d) {
+      e.preventDefault();
+      cursor.col += d[0];
+      cursor.row += d[1];
+      clampCursor();
+    } else if (e.code === 'Enter' || e.code === 'Space' || e.code === 'NumpadEnter') {
+      e.preventDefault();
+      markStarted();
+      clampCursor();
+      Engine.place(cursor.col, cursor.row);
+    } else if (e.code === 'KeyZ' || e.code === 'Backspace') {
+      // 悔棋快捷键（触屏端由 UI 提供按钮）
+      e.preventDefault();
+      if (typeof Engine.undo === 'function') Engine.undo();
+    } else if (e.code === 'KeyR') {
+      // 重开快捷键
+      e.preventDefault();
+      if (typeof Engine.reset === 'function') Engine.reset();
+    }
+  }
+
+  function loop(ts) {
+    if (typeof Engine.update === 'function') Engine.update(ts);
+    if (typeof Rules !== 'undefined' && typeof Rules.tick === 'function') Rules.tick();
+    UI.render(ctx2d, canvas.width, canvas.height);
+    raf = requestAnimationFrame(loop);
+  }
+
   host.register({
     mount: function (ctx) {
-      // ctx: 平台容器对象，含 bounds{w,h} / stage / onBounds
-      var rafId = 0;
-      var running = true;
-      var canvas = document.createElement('canvas');
-      var g2d = canvas.getContext('2d');
+      started = false;
+      cursor.col = 7;
+      cursor.row = 7;
 
-      var boundPointerDown = null;
-      var boundPointerMove = null;
-      var boundKeyDown = null;
+      canvas = document.createElement('canvas');
+      ctx2d = canvas.getContext('2d');
+      // 画布尺寸合同：ctx.bounds 字段为 w/h
+      applySize(ctx.bounds.w, ctx.bounds.h);
+      canvas.style.touchAction = 'none';
+      ctx.stage.appendChild(canvas);
 
-      // 键盘光标（列/行），与触屏并存，满足双输入合同
-      var cursor = { col: 7, row: 7 };
+      Engine.init();
+      if (typeof Rules !== 'undefined' && typeof Rules.init === 'function') Rules.init();
+      UI.init(ctx.stage);
 
-      function clampCursor() {
-        var n = Engine.getSize();
-        if (cursor.col < 0) cursor.col = 0;
-        if (cursor.row < 0) cursor.row = 0;
-        if (cursor.col > n - 1) cursor.col = n - 1;
-        if (cursor.row > n - 1) cursor.row = n - 1;
-      }
-
-      function handleBounds(b) {
-        canvas.width = b.w;
-        canvas.height = b.h;
-        canvas.style.position = 'absolute';
-        canvas.style.left = '0';
-        canvas.style.top = '0';
-        Engine.layout(b.w, b.h);
-      }
-
-      function frame(ts) {
-        if (!running) return;
-        Engine.update(ts);
-        UI.render(g2d, canvas.width, canvas.height);
-        rafId = requestAnimationFrame(frame);
-      }
-
-      function cellFromEvent(e) {
-        var rect = canvas.getBoundingClientRect();
-        var x = e.clientX - rect.left;
-        var y = e.clientY - rect.top;
-        return UI.pickCell(x, y); // {x,y} 格子坐标
-      }
-
-      function onPointerDown(e) {
-        e.preventDefault();
-        UI.markStarted();
-        var cell = cellFromEvent(e);
-        if (cell) {
-          cursor.col = cell.x;
-          cursor.row = cell.y;
-          Engine.place(cell.x, cell.y);
-        }
-      }
-
-      function onPointerMove() {
-        // 悬停高亮可选，当前无 hover 合同，保留触屏 pointerdown 即可
-      }
-
-      var KEYMAP = {
-        ArrowLeft: [-1, 0], ArrowRight: [1, 0],
-        ArrowUp: [0, -1], ArrowDown: [0, 1],
-        KeyA: [-1, 0], KeyD: [1, 0],
-        KeyW: [0, -1], KeyS: [0, 1]
+      // onBounds：注册即补发一次，跟随容器自适应
+      boundOnBounds = function (b) {
+        applySize(b.w, b.h);
+        if (typeof UI.relayout === 'function') UI.relayout(b.w, b.h);
       };
+      ctx.onBounds(boundOnBounds);
 
-      function onKeyDown(e) {
-        var d = KEYMAP[e.code];
-        if (d) {
-          e.preventDefault();
-          cursor.col += d[0];
-          cursor.row += d[1];
-          clampCursor();
-        } else if (e.code === 'Enter' || e.code === 'Space' || e.code === 'NumpadEnter') {
-          e.preventDefault();
-          UI.markStarted();
-          Engine.place(cursor.col, cursor.row);
-        }
-      }
+      // 双输入：触屏 pointerdown + 键盘方向/确认
+      boundPointerDown = onPointerDown;
+      boundPointerMove = onPointerMove;
+      boundKeyDown = onKeyDown;
+      canvas.addEventListener('pointerdown', boundPointerDown);
+      canvas.addEventListener('pointermove', boundPointerMove);
+      window.addEventListener('keydown', boundKeyDown);
 
-      function init() {
-        canvas.width = ctx.bounds.w;
-        canvas.height = ctx.bounds.h;
-        canvas.style.position = 'absolute';
-        canvas.style.left = '0';
-        canvas.style.top = '0';
-        canvas.style.touchAction = 'none';
-        ctx.stage.appendChild(canvas);
-
-        Engine.init();
-        UI.init(ctx.stage);
-        Engine.layout(ctx.bounds.w, ctx.bounds.h);
-        ctx.onBounds(handleBounds);
-
-        bindInput();
-
-        rafId = requestAnimationFrame(frame);
-      }
-
-      function bindInput() {
-        boundPointerDown = onPointerDown;
-        boundPointerMove = onPointerMove;
-        boundKeyDown = onKeyDown;
-        canvas.addEventListener('pointerdown', boundPointerDown);
-        canvas.addEventListener('pointermove', boundPointerMove);
-        window.addEventListener('keydown', boundKeyDown);
-      }
-
-      function unbindInput() {
-        if (boundPointerDown) canvas.removeEventListener('pointerdown', boundPointerDown);
-        if (boundPointerMove) canvas.removeEventListener('pointermove', boundPointerMove);
-        if (boundKeyDown) window.removeEventListener('keydown', boundKeyDown);
-        boundPointerDown = null;
-        boundPointerMove = null;
-        boundKeyDown = null;
-      }
-
-      init();
-
-      // 暴露给 destroy 的清理钩子
-      var self = this;
-      self._destroy = function () {
-        running = false;
-        if (rafId) cancelAnimationFrame(rafId);
-        rafId = 0;
-        unbindInput();
-        UI.destroy();
-        if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
-      };
+      raf = requestAnimationFrame(loop);
     },
 
     destroy: function () {
-      if (this._destroy) this._destroy();
-      this._destroy = null;
+      // 1) 停 RAF（句柄在闭包级，destroy 可达）
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      // 2) 解绑监听
+      if (boundPointerDown && canvas) canvas.removeEventListener('pointerdown', boundPointerDown);
+      if (boundPointerMove && canvas) canvas.removeEventListener('pointermove', boundPointerMove);
+      if (boundKeyDown) window.removeEventListener('keydown', boundKeyDown);
+      boundPointerDown = null;
+      boundPointerMove = null;
+      boundKeyDown = null;
+      boundOnBounds = null;
+      // 3) 清 UI 覆盖层（内部解绑 UI 自身 window 监听）
+      if (typeof UI.destroy === 'function') UI.destroy();
+      // 4) 清 DOM（canvas）
+      if (canvas && canvas.parentNode) canvas.parentNode.removeChild(canvas);
+      canvas = null;
+      ctx2d = null;
+      started = false;
     }
   });
 })();

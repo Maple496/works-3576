@@ -7,7 +7,12 @@ var UI = (function () {
   var turnEl = null;
   var overlay = null;  // 首次引导 / 结算浮层
   var btns = [];
+  var keyHandler = null;
   var started = false;
+
+  // 键盘光标状态（十字高亮）
+  var cur = { x: 7, y: 7 };
+  var curInit = false;
 
   function makeBtn(label, fn) {
     var b = document.createElement('button');
@@ -43,6 +48,7 @@ var UI = (function () {
       overlay.style.fontSize = '22px';
       overlay.style.textAlign = 'center';
       overlay.style.pointerEvents = 'none';
+      overlay.style.whiteSpace = 'pre-line';
       hud.appendChild(overlay);
     }
     overlay.textContent = text;
@@ -79,7 +85,12 @@ var UI = (function () {
     row.style.textAlign = 'center';
     row.style.marginTop = '4px';
     row.appendChild(makeBtn('悔棋', function () {
+      // 悔棋支持连点：每点一次退一手，并隐藏结算浮层
       Engine.undo();
+      if (curInit) {
+        var last = Engine.getLastMove && Engine.getLastMove();
+        if (last) { cur.x = last.x; cur.y = last.y; }
+      }
       hideOverlay();
     }));
     row.appendChild(makeBtn('重开', function () {
@@ -88,6 +99,31 @@ var UI = (function () {
       showOverlay('点击 / 触摸开始');
     }));
     hud.appendChild(row);
+
+    // 键盘方向键移动光标，Enter/空格落子
+    keyHandler = function (e) {
+      var L = Engine.getLayout();
+      if (!L) return;
+      var k = e.key;
+      var dx = 0, dy = 0;
+      if (k === 'ArrowLeft') dx = -1;
+      else if (k === 'ArrowRight') dx = 1;
+      else if (k === 'ArrowUp') dy = -1;
+      else if (k === 'ArrowDown') dy = 1;
+      else if (k === 'Enter' || k === ' ') {
+        e.preventDefault();
+        UI.markStarted();
+        Engine.place(cur.x, cur.y);
+        return;
+      } else {
+        return;
+      }
+      e.preventDefault();
+      curInit = true;
+      cur.x = Math.min(L.n - 1, Math.max(0, cur.x + dx));
+      cur.y = Math.min(L.n - 1, Math.max(0, cur.y + dy));
+    };
+    window.addEventListener('keydown', keyHandler);
 
     showOverlay('点击 / 触摸开始');
   }
@@ -125,7 +161,7 @@ var UI = (function () {
     var r = L.cell * 0.42;
     for (y = 0; y < L.n; y++) {
       for (x = 0; x < L.n; x++) {
-        var v = board[y * L.n + x];
+        var v = board[y][x];
         if (!v) continue;
         var cx = L.ox + x * L.cell;
         var cy = L.oy + y * L.cell;
@@ -140,6 +176,26 @@ var UI = (function () {
     }
   }
 
+  // 键盘光标：十字高亮 + 光标圈
+  function drawCursor(g, L) {
+    if (!curInit) return;
+    var cx = L.ox + cur.x * L.cell;
+    var cy = L.oy + cur.y * L.cell;
+    g.strokeStyle = 'rgba(255,60,60,0.75)';
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(L.ox, cy);
+    g.lineTo(L.ox + (L.n - 1) * L.cell, cy);
+    g.moveTo(cx, L.oy);
+    g.lineTo(cx, L.oy + (L.n - 1) * L.cell);
+    g.stroke();
+    g.beginPath();
+    g.arc(cx, cy, L.cell * 0.48, 0, Math.PI * 2);
+    g.strokeStyle = 'rgba(255,60,60,0.95)';
+    g.lineWidth = 2;
+    g.stroke();
+  }
+
   // render(g, w, h) -> void  每帧绘制
   function render(g, w, h) {
     // 背景
@@ -148,7 +204,10 @@ var UI = (function () {
 
     var L = Engine.getLayout();
     if (!L) return;
+    if (!curInit) { cur.x = Math.floor(L.n / 2); cur.y = Math.floor(L.n / 2); curInit = true; }
+
     drawBoard(g, L);
+    drawCursor(g, L);
 
     var board = Engine.getBoard();
     drawStones(g, board, L);
@@ -165,18 +224,17 @@ var UI = (function () {
     }
 
     // 回合提示
+    var winner = Engine.getWinner();
     if (turnEl) {
       var turn = Engine.getTurn();
-      var winner = Engine.getWinner();
       if (winner === 1) turnEl.textContent = '黑方胜利！';
       else if (winner === 2) turnEl.textContent = '白方胜利！';
       else turnEl.textContent = turn === 1 ? '轮到黑方' : '轮到白方';
     }
 
     // 胜利：横线 + 结算浮层
-    var winner = Engine.getWinner();
     if (winner) {
-      var line = Rules.getWinLine && Rules.getWinLine();
+      var line = Engine.getWinLine && Engine.getWinLine();
       if (line && line.length >= 2) {
         var a = line[0], b = line[line.length - 1];
         g.beginPath();
@@ -187,7 +245,7 @@ var UI = (function () {
         g.lineCap = 'round';
         g.stroke();
       }
-      showOverlay((winner === 1 ? '黑方' : '白方') + ' 获胜！\n点「重开」再来一局');
+      showOverlay((winner === 1 ? '黑方' : '白方') + ' 获胜！\n点「悔棋」复盘，或「重开」再来一局');
     }
   }
 
@@ -201,6 +259,7 @@ var UI = (function () {
     var dx = px - (L.ox + x * L.cell);
     var dy = py - (L.oy + y * L.cell);
     if (dx * dx + dy * dy > L.cell * L.cell * 0.36) return null;
+    cur.x = x; cur.y = y; curInit = true;
     return { x: x, y: y };
   }
 
@@ -211,10 +270,11 @@ var UI = (function () {
     }
   }
 
-  // destroy() -> void  移除覆盖层
+  // destroy() -> void  移除覆盖层与监听
   function destroy() {
-    for (var i = 0; i < btns.length; i++) {
-      btns[i].removeEventListener && btns[i].removeEventListener('click', btns[i]._fn);
+    if (keyHandler) {
+      window.removeEventListener('keydown', keyHandler);
+      keyHandler = null;
     }
     btns = [];
     if (hud && hud.parentNode) hud.parentNode.removeChild(hud);
@@ -223,6 +283,7 @@ var UI = (function () {
     overlay = null;
     stage = null;
     started = false;
+    curInit = false;
   }
 
   return {

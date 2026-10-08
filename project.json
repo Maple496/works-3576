@@ -7,19 +7,19 @@
   "files": [
     {
       "path": "src/engine.js",
-      "role": "引擎：游戏状态、回合流转、布局与主循环 update"
+      "role": ""
     },
     {
       "path": "src/rules.js",
-      "role": "规则：胜负判定与棋力辅助（五连检测、禁手可选）"
+      "role": ""
     },
     {
       "path": "src/ui.js",
-      "role": "界面：canvas 棋盘渲染 + stage 内 absolute 覆盖层（按钮/弹窗）"
+      "role": ""
     },
     {
       "path": "src/main.js",
-      "role": "入口：创建画布、装配引擎/规则/UI，唯一 Work.register 容器声明（mount + destroy）"
+      "role": ""
     }
   ],
   "generated_by": "proj_forge（AI 工程工坊）"
